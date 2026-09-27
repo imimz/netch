@@ -87,13 +87,17 @@ esac
 ok "وب‌سرور: $WEB"
 
 # ---------- چک DNS ----------
-SERVER_IP="$(curl -4 -s -m 8 https://api.ipify.org || true)"
+PUBLIC_IP="$(curl -4 -s -m 8 https://api.ipify.org || true)"
+LOCAL_IPS="$(hostname -I 2>/dev/null || true) $PUBLIC_IP"
 DOMAIN_IP="$(getent ahostsv4 "$DOMAIN" | awk 'NR==1{print $1}' || true)"
 if [[ -z "$DOMAIN_IP" ]]; then
-    warn "دامنه‌ی $DOMAIN هنوز به هیچ IPای resolve نمی‌شود. اول رکورد A آن را روی ${SERVER_IP:-IP این سرور} بگذارید."
+    warn "دامنه‌ی $DOMAIN هنوز به هیچ IPای resolve نمی‌شود. اول رکورد A آن را روی IP این سرور بگذارید."
     [[ "$NO_SSL" == "true" ]] || die "بدون DNS درست، گواهی SSL صادر نمی‌شود."
-elif [[ -n "$SERVER_IP" && "$DOMAIN_IP" != "$SERVER_IP" ]]; then
-    warn "دامنه‌ی $DOMAIN به $DOMAIN_IP اشاره می‌کند ولی IP این سرور $SERVER_IP است (اگر پشت CDN است مشکلی نیست)."
+elif [[ " $LOCAL_IPS " == *" $DOMAIN_IP "* ]]; then
+    ok "دامنه‌ی $DOMAIN به همین سرور ($DOMAIN_IP) اشاره می‌کند."
+else
+    warn "دامنه‌ی $DOMAIN به $DOMAIN_IP اشاره می‌کند ولی IPهای این سرور: $(echo $LOCAL_IPS)"
+    warn "بعد از تنظیم nginx با یک درخواست واقعی چک می‌شود که دامنه واقعاً به همین سرور می‌رسد یا نه."
 fi
 
 # ---------- نصب پکیج‌ها ----------
@@ -171,11 +175,33 @@ chmod 750 "$INSTALL_DIR/data"
 DENY_RE='^/(data/|config\.php|config\.sample\.php|lib\.php|retry_notify\.php|install\.sh)'
 if [[ "$WEB" == "nginx" ]]; then
     VHOST="/etc/nginx/sites-available/pay-gateway.conf"
+    VHOST_LINK="/etc/nginx/sites-enabled/pay-gateway.conf"
     if [[ -f "$VHOST" ]] && grep -q "managed-by-certbot\|# managed by Certbot" "$VHOST"; then
         info "vhost قبلی nginx (با SSL) حفظ شد: $VHOST"
     else
+        # اگر اجرای قبلی نیمه‌کاره مانده، اول vhost خودمان را غیرفعال می‌کنیم تا کانفیگ فعلی سالم تست شود
+        rm -f "$VHOST_LINK"
+        nginx -t >/dev/null 2>&1 || die "کانفیگ nginx همین الان (بدون درگاه) هم خطا دارد؛ اول آن را درست کنید:
+$(nginx -t 2>&1 | tail -3)"
+
+        # server_names_hash_bucket_size: اگر جایی تعریف نشده، در vhost خودمان تعریفش می‌کنیم؛
+        # اگر تعریف شده ولی کوچک است، مقدارش را بزرگ می‌کنیم (با نسخه‌ی پشتیبان)
+        HASH_LINE="server_names_hash_bucket_size 128;"
+        HASH_DEF="$(nginx -T 2>/dev/null | awk '/^# configuration file /{f=$4; sub(/:$/,"",f)} /^[[:space:]]*server_names_hash_bucket_size[[:space:]]/{gsub(/;/,"",$2); print f" "$2; exit}')"
+        if [[ -n "$HASH_DEF" ]]; then
+            HASH_FILE="${HASH_DEF% *}"; HASH_VAL="${HASH_DEF##* }"
+            HASH_LINE=""
+            if [[ "$HASH_VAL" =~ ^[0-9]+$ && "$HASH_VAL" -lt 64 ]]; then
+                cp -a "$HASH_FILE" "$HASH_FILE.bak-pay-gateway"
+                sed -i -E 's/^([[:space:]]*server_names_hash_bucket_size[[:space:]]+)[0-9]+;/\1128;/' "$HASH_FILE"
+                info "server_names_hash_bucket_size در $HASH_FILE از $HASH_VAL به 128 تغییر کرد (پشتیبان: $HASH_FILE.bak-pay-gateway)"
+            fi
+        fi
+
         cat > "$VHOST" <<EOF
 # درگاه واسط زرین‌پال — ساخته‌شده با install.sh
+$HASH_LINE
+
 server {
     listen 80;
     listen [::]:80;
@@ -197,9 +223,14 @@ server {
     }
 }
 EOF
-        ln -sf "$VHOST" /etc/nginx/sites-enabled/pay-gateway.conf
+        ln -sf "$VHOST" "$VHOST_LINK"
     fi
-    nginx -t 2>&1 | tail -2
+    if ! NGINX_TEST="$(nginx -t 2>&1)"; then
+        rm -f "$VHOST_LINK"
+        [[ -n "${HASH_FILE:-}" && -f "${HASH_FILE:-}.bak-pay-gateway" ]] && mv -f "$HASH_FILE.bak-pay-gateway" "$HASH_FILE"
+        die "تست کانفیگ nginx ناموفق بود؛ تغییرات برگردانده شد و سایت فعلی دست نخورده است:
+$NGINX_TEST"
+    fi
     systemctl reload nginx || systemctl restart nginx
 else
     VHOST="/etc/apache2/sites-available/pay-gateway.conf"
@@ -223,6 +254,21 @@ EOF
     systemctl reload apache2
 fi
 ok "vhost برای $DOMAIN فعال شد."
+
+# ---------- آیا دامنه واقعاً به همین سرور می‌رسد؟ ----------
+CHECK_NAME="gw-check-$(php -r 'echo bin2hex(random_bytes(8));').txt"
+echo "$CHECK_NAME" > "$INSTALL_DIR/$CHECK_NAME"
+CHECK_BODY="$(curl -s -m 15 "http://$DOMAIN/$CHECK_NAME" || true)"
+rm -f "$INSTALL_DIR/$CHECK_NAME"
+if [[ "$CHECK_BODY" == "$CHECK_NAME" ]]; then
+    ok "دامنه‌ی $DOMAIN به همین سرور می‌رسد."
+elif [[ "$NO_SSL" == "true" ]]; then
+    warn "درخواست به http://$DOMAIN به این سرور نرسید."
+else
+    die "درخواست به http://$DOMAIN به این سرور نرسید (دامنه به ${DOMAIN_IP:-?} اشاره می‌کند).
+  یا اسکریپت را روی سروری اجرا کرده‌اید که دامنه به آن اشاره نمی‌کند، یا پورت 80 بسته است.
+  رکورد A دامنه را روی IP همین سرور بگذارید (یا اسکریپت را روی سرور $DOMAIN_IP اجرا کنید) و دوباره اجرا کنید."
+fi
 
 # ---------- SSL ----------
 if [[ "$NO_SSL" != "true" ]]; then
