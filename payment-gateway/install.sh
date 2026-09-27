@@ -21,6 +21,8 @@ EMAIL=""
 INSTALL_DIR="/var/www/pay-gateway"
 SANDBOX="false"
 NO_SSL="false"
+CDN="false"
+PROXY=""
 SITE_NAME="ایتریمر"
 BOT_TITLE="ربات میرزا پرو"
 
@@ -40,6 +42,8 @@ usage() {
   --email        ایمیل برای گواهی SSL (Let's Encrypt)
   --dir          مسیر نصب (پیش‌فرض: /var/www/pay-gateway)
   --sandbox      استفاده از سندباکس زرین‌پال برای تست
+  --cdn          SSL را CDN (مثل ابر آروان یا Cloudflare) می‌دهد؛ روی سرور گواهی گرفته نمی‌شود
+  --proxy URL    پروکسی برای اتصال certbot به Let's Encrypt (مثلاً http://127.0.0.1:10809)
   --no-ssl       بدون گرفتن گواهی SSL (فقط برای تست؛ زرین‌پال callback غیر HTTPS را نمی‌پذیرد)
 EOF
     exit "${1:-0}"
@@ -55,6 +59,8 @@ while [[ $# -gt 0 ]]; do
         --dir)        INSTALL_DIR="${2:-}"; shift 2 ;;
         --sandbox)    SANDBOX="true"; shift ;;
         --no-ssl)     NO_SSL="true"; shift ;;
+        --cdn)        CDN="true"; shift ;;
+        --proxy)      PROXY="${2:-}"; shift 2 ;;
         -h|--help)    usage 0 ;;
         *)            echo "گزینه‌ی ناشناخته: $1"; usage 1 ;;
     esac
@@ -64,6 +70,8 @@ done
 [[ -n "$DOMAIN" ]] || die "--domain الزامی است."
 [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die "دامنه نامعتبر است: $DOMAIN"
 [[ "$MERCHANT" =~ ^[0-9a-fA-F-]{36}$ ]] || die "مرچنت کد باید ۳۶ کاراکتر باشد (مثل xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)."
+USE_CERTBOT="true"
+[[ "$NO_SSL" == "true" || "$CDN" == "true" ]] && USE_CERTBOT="false"
 command -v apt-get >/dev/null || die "این اسکریپت فقط برای Ubuntu/Debian نوشته شده."
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gateway"
@@ -92,7 +100,7 @@ LOCAL_IPS="$(hostname -I 2>/dev/null || true) $PUBLIC_IP"
 DOMAIN_IP="$(getent ahostsv4 "$DOMAIN" | awk 'NR==1{print $1}' || true)"
 if [[ -z "$DOMAIN_IP" ]]; then
     warn "دامنه‌ی $DOMAIN هنوز به هیچ IPای resolve نمی‌شود. اول رکورد A آن را روی IP این سرور بگذارید."
-    [[ "$NO_SSL" == "true" ]] || die "بدون DNS درست، گواهی SSL صادر نمی‌شود."
+    [[ "$USE_CERTBOT" == "false" ]] || die "بدون DNS درست، گواهی SSL صادر نمی‌شود."
 elif [[ " $LOCAL_IPS " == *" $DOMAIN_IP "* ]]; then
     ok "دامنه‌ی $DOMAIN به همین سرور ($DOMAIN_IP) اشاره می‌کند."
 else
@@ -105,7 +113,7 @@ info "نصب PHP و افزونه‌ها..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq || warn "apt-get update با خطا تمام شد؛ ادامه می‌دهیم..."
 PKGS=(php-fpm php-cli php-curl php-sqlite3 curl)
-if [[ "$NO_SSL" != "true" ]]; then
+if [[ "$USE_CERTBOT" == "true" ]]; then
     PKGS+=(certbot)
     if [[ "$WEB" == "nginx" ]]; then PKGS+=(python3-certbot-nginx); else PKGS+=(python3-certbot-apache); fi
 fi
@@ -283,7 +291,7 @@ ok "vhost برای $DOMAIN فعال شد."
 # ---------- آیا دامنه واقعاً به همین سرور می‌رسد؟ ----------
 CHECK_NAME="gw-check-$(php -r 'echo bin2hex(random_bytes(8));').txt"
 echo "$CHECK_NAME" > "$INSTALL_DIR/$CHECK_NAME"
-CHECK_BODY="$(curl -s -m 15 "http://$DOMAIN/$CHECK_NAME" || true)"
+CHECK_BODY="$(curl -sL -m 15 "http://$DOMAIN/$CHECK_NAME" || true)"
 if [[ "$CHECK_BODY" != "$CHECK_NAME" ]]; then
     DIAG_PUBLIC="$(curl -s -m 15 -o /dev/null -D - "http://$DOMAIN/$CHECK_NAME" 2>&1 | head -4 || true)"
     DIAG_LOCAL="$(curl -s -m 15 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/$CHECK_NAME" 2>&1 | head -c 200 || true)"
@@ -305,12 +313,29 @@ $DIAG_LISTEN"
 fi
 
 # ---------- SSL ----------
-if [[ "$NO_SSL" != "true" ]]; then
+if [[ "$CDN" == "true" ]]; then
+    info "SSL توسط CDN داده می‌شود؛ روی سرور گواهی گرفته نشد."
+elif [[ "$USE_CERTBOT" == "true" ]]; then
     info "گرفتن گواهی SSL برای $DOMAIN ..."
+    PROXY_ENV=()
+    [[ -n "$PROXY" ]] && PROXY_ENV=(HTTPS_PROXY="$PROXY" HTTP_PROXY="$PROXY" https_proxy="$PROXY" http_proxy="$PROXY")
+    if ! env "${PROXY_ENV[@]}" curl -s -m 20 -o /dev/null https://acme-v02.api.letsencrypt.org/directory; then
+        die "این سرور به Let's Encrypt (acme-v02.api.letsencrypt.org) وصل نمی‌شود؛ احتمالاً فیلتر است.
+  یکی از این دو راه:
+  ۱) SSL از طریق CDN (مثلاً ابر آروان): در پنل DNS، رکورد $DOMAIN را روی حالت پروکسی (ابر روشن) بگذارید،
+     SSL آن را در پنل CDN فعال کنید و پروتکل اتصال به مبدأ را HTTP بگذارید؛ بعد اسکریپت را با --cdn اجرا کنید.
+  ۲) اگر روی همین سرور پروکسی (مثلاً xray/v2ray) دارید، اسکریپت را با --proxy http://127.0.0.1:PORT اجرا کنید."
+    fi
     EMAIL_ARGS=(--register-unsafely-without-email)
     [[ -n "$EMAIL" ]] && EMAIL_ARGS=(-m "$EMAIL")
-    certbot "--$WEB" -d "$DOMAIN" --non-interactive --agree-tos --redirect --keep-until-expiring "${EMAIL_ARGS[@]}" \
-        || die "گرفتن گواهی SSL ناموفق بود. DNS دامنه و باز بودن پورت 80 را چک کنید و اسکریپت را دوباره اجرا کنید."
+    env "${PROXY_ENV[@]}" certbot "--$WEB" -d "$DOMAIN" --non-interactive --agree-tos --redirect --keep-until-expiring "${EMAIL_ARGS[@]}" \
+        || die "گرفتن گواهی SSL ناموفق بود. لاگ: /var/log/letsencrypt/letsencrypt.log"
+    if [[ -n "$PROXY" && -d /etc/systemd/system ]]; then
+        # تمدید خودکار گواهی هم باید از همین پروکسی رد شود
+        mkdir -p /etc/systemd/system/certbot.service.d
+        printf '[Service]\nEnvironment="HTTPS_PROXY=%s" "HTTP_PROXY=%s"\n' "$PROXY" "$PROXY" > /etc/systemd/system/certbot.service.d/pay-gateway-proxy.conf
+        systemctl daemon-reload || true
+    fi
     ok "SSL فعال شد."
     if [[ "$WEB" == "nginx" ]]; then
         ADDED_443=""
