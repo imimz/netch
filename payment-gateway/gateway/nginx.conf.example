@@ -1,0 +1,34 @@
+# نمونه‌ی کانفیگ nginx برای سرور ایتریمر
+# اگر درگاه روی ساب‌دامین جدا (مثلاً pay.etrimer.ir) است:
+
+server {
+    listen 443 ssl http2;
+    server_name pay.etrimer.ir;
+
+    ssl_certificate     /etc/letsencrypt/live/pay.etrimer.ir/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pay.etrimer.ir/privkey.pem;
+
+    root /var/www/pay-gateway;
+    index index.php;
+
+    # فایل‌های حساس از بیرون در دسترس نباشند
+    location ~ ^/(data/|config\.php|config\.sample\.php|lib\.php|retry_notify\.php) {
+        return 404;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/run/php/php8.2-fpm.sock;  # نسخه‌ی PHP سرور خودتان را بگذارید
+    }
+}
+
+# اگر درگاه داخل یک پوشه روی دامنه‌ی اصلی سایت است (مثلاً https://etrimer.ir/pay)
+# این بلاک را داخل server سایت اصلی اضافه کنید:
+#
+#   location ~ ^/pay/(data/|config\.php|config\.sample\.php|lib\.php|retry_notify\.php) {
+#       return 404;
+#   }
