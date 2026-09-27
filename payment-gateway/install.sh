@@ -111,10 +111,20 @@ if [[ "$NO_SSL" != "true" ]]; then
 fi
 if [[ "$WEB" == "nginx" ]] && ! command -v nginx >/dev/null; then PKGS+=(nginx); fi
 apt-get install -y -qq "${PKGS[@]}" >/dev/null || die "نصب پکیج‌ها ناموفق بود: ${PKGS[*]}"
-php -m | grep -qi pdo_sqlite || die "افزونه‌ی pdo_sqlite روی PHP فعال نشد."
-php -m | grep -qi '^curl$'   || die "افزونه‌ی curl روی PHP فعال نشد."
-
 PHP_VER="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
+php_has() { grep -qix "$1" <<<"$(php -m 2>/dev/null)"; }
+if ! php_has curl || ! php_has pdo_sqlite; then
+    info "نصب افزونه‌های مخصوص PHP $PHP_VER ..."
+    apt-get install -y -qq "php${PHP_VER}-curl" "php${PHP_VER}-sqlite3" "php${PHP_VER}-fpm" >/dev/null \
+        || die "نصب php${PHP_VER}-curl / php${PHP_VER}-sqlite3 ناموفق بود."
+    phpenmod -v "$PHP_VER" curl pdo_sqlite 2>/dev/null || true
+fi
+for ext in curl pdo_sqlite; do
+    php_has "$ext" || die "افزونه‌ی $ext روی PHP $PHP_VER فعال نشد.
+  php: $(command -v php) ($(php -r 'echo PHP_VERSION;'))
+  ini: $(php --ini 2>/dev/null | grep -i 'loaded configuration' || true)
+  پکیج‌ها: $(dpkg -l 2>/dev/null | awk '/^ii/ && /php.*(curl|sqlite)/{printf "%s ", $2}' || true)"
+done
 FPM_SERVICE="php${PHP_VER}-fpm"
 systemctl enable --now "$FPM_SERVICE" >/dev/null 2>&1 || true
 FPM_SOCK="/run/php/php${PHP_VER}-fpm.sock"
@@ -187,7 +197,8 @@ $(nginx -t 2>&1 | tail -3)"
         # server_names_hash_bucket_size: اگر جایی تعریف نشده، در vhost خودمان تعریفش می‌کنیم؛
         # اگر تعریف شده ولی کوچک است، مقدارش را بزرگ می‌کنیم (با نسخه‌ی پشتیبان)
         HASH_LINE="server_names_hash_bucket_size 128;"
-        HASH_DEF="$(nginx -T 2>/dev/null | awk '/^# configuration file /{f=$4; sub(/:$/,"",f)} /^[[:space:]]*server_names_hash_bucket_size[[:space:]]/{gsub(/;/,"",$2); print f" "$2; exit}')"
+        NGINX_DUMP="$(nginx -T 2>/dev/null || true)"
+        HASH_DEF="$(awk '/^# configuration file /{f=$4; sub(/:$/,"",f)} !done && /^[[:space:]]*server_names_hash_bucket_size[[:space:]]/{gsub(/;/,"",$2); print f" "$2; done=1}' <<<"$NGINX_DUMP")"
         if [[ -n "$HASH_DEF" ]]; then
             HASH_FILE="${HASH_DEF% *}"; HASH_VAL="${HASH_DEF##* }"
             HASH_LINE=""
