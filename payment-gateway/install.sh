@@ -182,12 +182,19 @@ chmod 640 "$CONFIG"
 chmod 750 "$INSTALL_DIR/data"
 
 # ---------- vhost ----------
+# IPv4هایی که در کانفیگ فعلی nginx صریحاً روی یک پورت listen شده‌اند (مثل listen 1.2.3.4:80)
+ip_listens() {
+    local port="$1" re
+    if [[ "$port" == 80 ]]; then re='(?=(:80)?[\s;])'; else re="(?=:${port}[\s;])"; fi
+    grep -oP '^\s*listen\s+\K\d{1,3}(\.\d{1,3}){3}'"$re" <<<"${NGINX_DUMP:-}" | sort -u || true
+}
 DENY_RE='^/(data/|config\.php|config\.sample\.php|lib\.php|retry_notify\.php|install\.sh)'
 if [[ "$WEB" == "nginx" ]]; then
     VHOST="/etc/nginx/sites-available/pay-gateway.conf"
     VHOST_LINK="/etc/nginx/sites-enabled/pay-gateway.conf"
     if [[ -f "$VHOST" ]] && grep -q "managed-by-certbot\|# managed by Certbot" "$VHOST"; then
         info "vhost قبلی nginx (با SSL) حفظ شد: $VHOST"
+        NGINX_DUMP="$(nginx -T 2>/dev/null || true)"
     else
         # اگر اجرای قبلی نیمه‌کاره مانده، اول vhost خودمان را غیرفعال می‌کنیم تا کانفیگ فعلی سالم تست شود
         rm -f "$VHOST_LINK"
@@ -198,6 +205,13 @@ $(nginx -t 2>&1 | tail -3)"
         # اگر تعریف شده ولی کوچک است، مقدارش را بزرگ می‌کنیم (با نسخه‌ی پشتیبان)
         HASH_LINE="server_names_hash_bucket_size 128;"
         NGINX_DUMP="$(nginx -T 2>/dev/null || true)"
+        # اگر سایت فعلی روی یک IP مشخص listen کرده (مثلاً listen 5.160.110.77:80)، nginx برای درخواست‌های
+        # آن IP فقط سراغ همان server blockها می‌رود؛ پس درگاه هم باید روی همان IP listen کند
+        EXTRA_LISTEN_80=""
+        for ip in $(ip_listens 80); do
+            EXTRA_LISTEN_80+="    listen $ip:80;"$'\n'
+            info "سایت فعلی روی $ip:80 listen کرده؛ درگاه هم روی همین آدرس listen می‌کند."
+        done
         HASH_DEF="$(awk '/^# configuration file /{f=$4; sub(/:$/,"",f)} !done && /^[[:space:]]*server_names_hash_bucket_size[[:space:]]/{gsub(/;/,"",$2); print f" "$2; done=1}' <<<"$NGINX_DUMP")"
         if [[ -n "$HASH_DEF" ]]; then
             HASH_FILE="${HASH_DEF% *}"; HASH_VAL="${HASH_DEF##* }"
@@ -216,7 +230,7 @@ $HASH_LINE
 server {
     listen 80;
     listen [::]:80;
-    server_name $DOMAIN;
+${EXTRA_LISTEN_80}    server_name $DOMAIN;
     root $INSTALL_DIR;
     index index.php;
     client_max_body_size 1m;
@@ -270,15 +284,24 @@ ok "vhost برای $DOMAIN فعال شد."
 CHECK_NAME="gw-check-$(php -r 'echo bin2hex(random_bytes(8));').txt"
 echo "$CHECK_NAME" > "$INSTALL_DIR/$CHECK_NAME"
 CHECK_BODY="$(curl -s -m 15 "http://$DOMAIN/$CHECK_NAME" || true)"
+if [[ "$CHECK_BODY" != "$CHECK_NAME" ]]; then
+    DIAG_PUBLIC="$(curl -s -m 15 -o /dev/null -D - "http://$DOMAIN/$CHECK_NAME" 2>&1 | head -4 || true)"
+    DIAG_LOCAL="$(curl -s -m 15 --resolve "$DOMAIN:80:127.0.0.1" "http://$DOMAIN/$CHECK_NAME" 2>&1 | head -c 200 || true)"
+    DIAG_LISTEN="$(nginx -T 2>/dev/null | grep -E '^[[:space:]]*listen[[:space:]]' | sed 's/^[[:space:]]*//' | sort | uniq -c || true)"
+fi
 rm -f "$INSTALL_DIR/$CHECK_NAME"
 if [[ "$CHECK_BODY" == "$CHECK_NAME" ]]; then
     ok "دامنه‌ی $DOMAIN به همین سرور می‌رسد."
 elif [[ "$NO_SSL" == "true" ]]; then
     warn "درخواست به http://$DOMAIN به این سرور نرسید."
 else
-    die "درخواست به http://$DOMAIN به این سرور نرسید (دامنه به ${DOMAIN_IP:-?} اشاره می‌کند).
-  یا اسکریپت را روی سروری اجرا کرده‌اید که دامنه به آن اشاره نمی‌کند، یا پورت 80 بسته است.
-  رکورد A دامنه را روی IP همین سرور بگذارید (یا اسکریپت را روی سرور $DOMAIN_IP اجرا کنید) و دوباره اجرا کنید."
+    die "درخواست به http://$DOMAIN به vhost درگاه نرسید (دامنه به ${DOMAIN_IP:-?} اشاره می‌کند).
+  این اطلاعات را برای عیب‌یابی بفرستید:
+  --- پاسخ از طریق دامنه:
+$DIAG_PUBLIC
+  --- پاسخ از طریق 127.0.0.1: ${DIAG_LOCAL:-<خالی>}
+  --- listenهای nginx:
+$DIAG_LISTEN"
 fi
 
 # ---------- SSL ----------
@@ -289,6 +312,24 @@ if [[ "$NO_SSL" != "true" ]]; then
     certbot "--$WEB" -d "$DOMAIN" --non-interactive --agree-tos --redirect --keep-until-expiring "${EMAIL_ARGS[@]}" \
         || die "گرفتن گواهی SSL ناموفق بود. DNS دامنه و باز بودن پورت 80 را چک کنید و اسکریپت را دوباره اجرا کنید."
     ok "SSL فعال شد."
+    if [[ "$WEB" == "nginx" ]]; then
+        ADDED_443=""
+        for ip in $(ip_listens 443); do
+            grep -q "listen $ip:443 ssl" "$VHOST" && continue
+            sed -i "0,/^[[:space:]]*listen 443 ssl/s//    listen $ip:443 ssl; # pay-gateway\n&/" "$VHOST"
+            ADDED_443+="$ip "
+        done
+        if [[ -n "$ADDED_443" ]]; then
+            if nginx -t >/dev/null 2>&1; then
+                systemctl reload nginx
+                info "درگاه روی $ADDED_443(پورت 443) هم listen می‌کند."
+            else
+                sed -i '/# pay-gateway$/d' "$VHOST"
+                warn "افزودن listen مخصوص IP روی 443 خطا داد و برگردانده شد:"
+                nginx -t 2>&1 | tail -3 || true
+            fi
+        fi
+    fi
 fi
 
 # ---------- کرون ----------
@@ -301,12 +342,11 @@ ok "کرون ارسال دوباره نصب شد."
 
 # ---------- تست ----------
 info "تست..."
-code() { curl -s -o /dev/null -w '%{http_code}' -m 15 --resolve "$DOMAIN:${2}:127.0.0.1" "$1"; }
-PORT=443; [[ "$NO_SSL" == "true" ]] && PORT=80
-HOME_BODY="$(curl -s -m 15 --resolve "$DOMAIN:$PORT:127.0.0.1" "$BASE_URL/" || true)"
+code() { curl -s -o /dev/null -w '%{http_code}' -m 15 "$1"; }
+HOME_BODY="$(curl -s -m 15 "$BASE_URL/" || true)"
 if grep -q 'لینک نامعتبر' <<<"$HOME_BODY"; then ok "صفحه‌ی درگاه بالا آمد: $BASE_URL"; else warn "صفحه‌ی اصلی درگاه جواب مورد انتظار را نداد؛ لاگ‌ها: $INSTALL_DIR/data/error.log و لاگ $WEB"; fi
 for p in config.php data/gateway.sqlite lib.php; do
-    c="$(code "$BASE_URL/$p" "$PORT")"
+    c="$(code "$BASE_URL/$p")"
     if [[ "$c" == "403" || "$c" == "404" ]]; then ok "$p از بیرون بسته است ($c)"; else warn "$p از بیرون در دسترس است (HTTP $c)! کانفیگ وب‌سرور را چک کنید."; fi
 done
 
