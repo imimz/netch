@@ -36,6 +36,31 @@
 
 ## ۱) نصب روی سرور ایتریمر
 
+### نصب خودکار (پیشنهادی — Ubuntu/Debian با nginx یا Apache)
+
+رکورد A دامنه‌ی درگاه باید به IP سرور اشاره کند. بعد روی سرور:
+
+```bash
+git clone -b claude/keen-heisenberg-1xftxd --depth 1 https://github.com/imimz/netch.git /tmp/netch
+sudo bash /tmp/netch/payment-gateway/install.sh \
+  --domain pay.example.com \
+  --merchant xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx \
+  --return-url https://t.me/YourBot \
+  --email you@example.com
+```
+
+این اسکریپت:
+- PHP و افزونه‌های لازم را نصب می‌کند.
+- یک vhost جدید فقط برای همین دامنه می‌سازد و به کانفیگ سایت فعلی دست نمی‌زند.
+- گواهی SSL می‌گیرد.
+- `config.php` را با یک secret تصادفی می‌سازد.
+- کرون ارسال دوباره را نصب می‌کند.
+
+در آخر هم `gateway_url` و `secret` را چاپ می‌کند تا آن‌ها را در تنظیمات ربات بگذارید.
+اجرای دوباره‌ی آن امن است و `config.php` و دیتابیس قبلی را نگه می‌دارد.
+
+### نصب دستی
+
 ۱. محتویات پوشه‌ی `gateway/` را روی سرور ایتریمر آپلود کنید. مثلاً در `/var/www/pay-gateway` برای ساب‌دامین `pay.etrimer.ir`، یا در پوشه‌ی `pay/` داخل سایت فعلی.
 
 ۲. فایل تنظیمات را بسازید:
