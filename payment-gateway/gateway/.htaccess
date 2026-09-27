@@ -1,0 +1,6 @@
+# Apache: جلوگیری از دسترسی مستقیم به فایل‌های حساس
+Options -Indexes
+<FilesMatch "^(config\.php|config\.sample\.php|lib\.php|retry_notify\.php)$">
+    Require all denied
+</FilesMatch>
+RedirectMatch 404 ^/(.*/)?data(/|$)
